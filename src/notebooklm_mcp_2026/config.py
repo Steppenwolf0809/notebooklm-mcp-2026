@@ -23,7 +23,8 @@ CHROME_PROFILE_DIR = STORAGE_DIR / "chrome-profile"
 # API endpoints
 # ---------------------------------------------------------------------------
 
-BASE_URL = "https://notebooklm.google.com"
+NOTEBOOKLM_HOST = "notebook.google.com"
+BASE_URL = f"https://{NOTEBOOKLM_HOST}"
 BATCHEXECUTE_URL = f"{BASE_URL}/_/LabsTailwindUi/data/batchexecute"
 QUERY_ENDPOINT = (
     "/_/LabsTailwindUi/data/"
@@ -34,7 +35,7 @@ QUERY_ENDPOINT = (
 # Build label — overridable via env var when Google rotates it
 BUILD_LABEL = os.environ.get(
     "NOTEBOOKLM_BL",
-    "boq_labs-tailwind-frontend_20260108.06_p0",
+    "boq_labs-tailwind-frontend_20261005.13_p0",
 )
 
 # ---------------------------------------------------------------------------

@@ -22,20 +22,23 @@ import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from collections.abc import Callable
 
 from .config import (
     AUTH_FILE,
+    BASE_URL,
     CHROME_PROFILE_DIR,
     ESSENTIAL_COOKIES,
+    NOTEBOOKLM_HOST,
     REQUIRED_COOKIES,
     STORAGE_DIR,
 )
 
 logger = logging.getLogger("notebooklm_mcp_2026.auth")
 
-NOTEBOOKLM_URL = "https://notebooklm.google.com/"
+NOTEBOOKLM_URL = BASE_URL + "/"
 CDP_PORT_START = 9222
 CDP_PORT_RANGE = 10  # scan 9222–9231
 
@@ -109,6 +112,22 @@ def load_tokens() -> AuthTokens | None:
 def validate_cookies(cookies: dict[str, str]) -> bool:
     """Check that all required Google auth cookies are present."""
     return REQUIRED_COOKIES.issubset(cookies.keys())
+
+
+def select_essential_cookies(raw: list[dict]) -> dict[str, str]:
+    """Keep shared Google cookies and prefer cookies scoped to NotebookLM."""
+    shared = {}
+    scoped = {}
+    for cookie in raw:
+        name = cookie.get("name", "")
+        if name not in ESSENTIAL_COOKIES:
+            continue
+        domain = cookie.get("domain", "")
+        if domain == ".google.com":
+            shared[name] = cookie.get("value", "")
+        elif domain.lstrip(".") == NOTEBOOKLM_HOST:
+            scoped[name] = cookie.get("value", "")
+    return shared | scoped
 
 
 # ---------------------------------------------------------------------------
@@ -369,7 +388,7 @@ def extract_csrf_from_html(html: str) -> str:
 
 def extract_session_id_from_html(html: str) -> str:
     """Extract the session ID (``FdrFJe``) from page HTML."""
-    for pattern in (r'"FdrFJe":"(\d+)"', r'f\.sid["\s:=]+["\']?(\d+)'):
+    for pattern in (r'"FdrFJe":"(-?\d+)"', r'f\.sid["\s:=]+["\']?(-?\d+)'):
         match = re.search(pattern, html)
         if match:
             return match.group(1)
@@ -386,6 +405,7 @@ def extract_cookies_via_cdp(
     login_timeout: int = 300,
     chrome_path: str | None = None,
     on_manual_launch_needed: Callable[[int, list[str]], None] | None = None,
+    on_login_progress: Callable[[dict], None] | None = None,
 ) -> AuthTokens:
     """Launch Chrome, wait for the user to log in, and extract auth tokens.
 
@@ -457,41 +477,36 @@ def extract_cookies_via_cdp(
 
         while time.time() - start < login_timeout:
             try:
-                # Check if the required auth cookies exist yet
-                raw = _get_page_cookies(ws_url)
-                candidate: dict[str, str] = {}
-                for c in raw:
-                    name = c.get("name", "")
-                    domain = c.get("domain", "")
-                    if name in ESSENTIAL_COOKIES and ".google.com" in domain:
-                        candidate[name] = c.get("value", "")
-                if REQUIRED_COOKIES.issubset(candidate.keys()):
-                    cookies = candidate
-                    break
-            except Exception:
-                pass
+                # Existing cookies do not prove that reauthentication has
+                # finished. Leave Google's password/consent page untouched.
+                current_url = _get_current_url(ws_url)
+                progress = {"host": urlparse(current_url).hostname}
+                if urlparse(current_url).hostname == NOTEBOOKLM_HOST:
+                    html = _get_page_html(ws_url)
+                    csrf_token = extract_csrf_from_html(html)
+                    session_id = extract_session_id_from_html(html)
+                    candidate = select_essential_cookies(_get_page_cookies(ws_url))
+                    progress.update(
+                        csrf_present=bool(csrf_token),
+                        session_id_present=bool(session_id),
+                        missing_cookie_names=sorted(REQUIRED_COOKIES - candidate.keys()),
+                    )
+                    if on_login_progress:
+                        on_login_progress(progress)
+                    if csrf_token and session_id and validate_cookies(candidate):
+                        cookies = candidate
+                        break
+                elif on_login_progress:
+                    on_login_progress(progress)
+            except Exception as exc:
+                if on_login_progress:
+                    on_login_progress({"inspection_error_type": type(exc).__name__})
             time.sleep(5)
         else:
             raise RuntimeError(
                 f"Login timed out after {login_timeout}s. "
                 "Please log in to NotebookLM in the Chrome window."
             )
-
-        # Navigate back to NotebookLM so we can extract CSRF + session ID
-        # from the page HTML (the user may still be on accounts.google.com
-        # or a consent screen after cookies are set).
-        try:
-            current_url = _get_current_url(ws_url)
-            if "notebooklm.google.com" not in current_url:
-                _navigate_to_url(ws_url, NOTEBOOKLM_URL)
-                time.sleep(3)
-        except Exception:
-            pass
-
-        # Extract CSRF and session ID from page HTML
-        html = _get_page_html(ws_url)
-        csrf_token = extract_csrf_from_html(html)
-        session_id = extract_session_id_from_html(html)
 
         return AuthTokens(
             cookies=cookies,
@@ -529,7 +544,7 @@ def _find_notebooklm_page(port: int, max_attempts: int = 5) -> dict | None:
     for attempt in range(max_attempts):
         pages = _get_pages(port)
         for page in pages:
-            if "notebooklm.google.com" in page.get("url", ""):
+            if urlparse(page.get("url", "")).hostname == NOTEBOOKLM_HOST:
                 return page
 
         # If we got pages but none match, try creating a new tab
